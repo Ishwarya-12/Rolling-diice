@@ -1,0 +1,310 @@
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <SPI.h>
+#include <math.h>
+
+#define TFT_CS  10
+#define TFT_RST 9
+#define TFT_DC  8
+
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+
+const int buttonPin = 2;
+int diceValue = 1;
+
+// ---------- CUBE GEOMETRY ----------
+float vertices[8][3] = {
+  {-1,-1,-1}, {1,-1,-1}, {1,1,-1}, {-1,1,-1},
+  {-1,-1, 1}, {1,-1, 1}, {1,1, 1}, {-1,1, 1}
+};
+
+// Each face: 4 vertex indices (wound so outward normal is correct) + die value
+struct Face { int v[4]; int value; };
+Face faces[6] = {
+  {{0,3,2,1}, 1},
+  {{4,5,6,7}, 6},
+  {{0,1,5,4}, 2},
+  {{3,7,6,2}, 5},
+  {{0,4,7,3}, 3},
+  {{1,2,6,5}, 4}
+};
+
+// Pip local positions (u,v) per die value, range ~[-0.5, 0.5]
+const float pipPos[6][6][2] = {
+  {{0,0}},
+  {{-0.5,-0.5},{0.5,0.5}},
+  {{-0.5,-0.5},{0,0},{0.5,0.5}},
+  {{-0.5,-0.5},{0.5,-0.5},{-0.5,0.5},{0.5,0.5}},
+  {{-0.5,-0.5},{0.5,-0.5},{0,0},{-0.5,0.5},{0.5,0.5}},
+  {{-0.5,-0.5},{0.5,-0.5},{-0.5,0},{0.5,0},{-0.5,0.5},{0.5,0.5}}
+};
+const int pipCount[6] = {1,2,3,4,5,6};
+
+// Target rotation angles (radians) so that each value's face points at the camera
+const float targetAngles[6][3] = {
+  {0,        0,        0},        // 1
+  {PI/2.0,   0,        0},        // 2
+  {0,       -PI/2.0,   0},        // 3
+  {0,        PI/2.0,   0},        // 4
+  {-PI/2.0,  0,        0},        // 5
+  {PI,       0,        0}         // 6
+};
+
+int screenCenterX;
+int restY = 130;
+float scaleSize = 38; // was 55 — smaller cube = fewer pixels per fillTriangle/fillRect
+float fov = 4.0;
+float distance = 4.0;
+
+int prevBoxX = 0, prevBoxY = 0, prevBoxW = 0, prevBoxH = 0;
+
+void setup() {
+  pinMode(buttonPin, INPUT_PULLUP);
+  tft.begin();
+  SPI.setClockDivider(SPI_CLOCK_DIV2); // maximize SPI speed if not already maxed
+  tft.setRotation(0);
+  tft.fillScreen(ILI9341_BLACK);
+  randomSeed(analogRead(A0));
+
+  screenCenterX = tft.width() / 2;
+
+  float rotV[8][3];
+  rotateOnly(0, 0, 0, rotV);
+  drawSolidDice(rotV, screenCenterX, restY);
+
+  showPrompt();
+}
+
+void loop() {
+  if (digitalRead(buttonPin) == LOW) {
+    delay(10);
+    if (digitalRead(buttonPin) == LOW) {
+      throwDice3D();
+      while (digitalRead(buttonPin) == LOW) delay(10);
+    }
+  }
+}
+
+// ---------- THROW + GRAVITY + BOUNCE + SETTLE ----------
+void throwDice3D() {
+  tft.fillRect(0, 250, tft.width(), 40, ILI9341_BLACK);
+
+  float posX = (random(0,2) == 0) ? 40 : tft.width() - 40;
+  float posY = restY - 160;
+  float velX = (screenCenterX - posX) / 18.0;
+  float velY = 0;
+  float gravity = 1.1;
+  float damping = 0.45;
+  int bounceCount = 0;
+  int maxBounces = 2;
+
+  float ax = 0, ay = 0, az = 0;
+  float spinX = random(15, 30) / 10.0;
+  float spinY = random(15, 30) / 10.0;
+  float spinZ = random(10, 25) / 10.0;
+
+  int frame = 0, maxFrames = 40;
+  float rotV[8][3];
+
+  while (bounceCount < maxBounces && frame < maxFrames) {
+    velY += gravity;
+    posY += velY;
+    posX += velX;
+
+    bool bounced = false;
+    if (posY >= restY) {
+      posY = restY;
+      velY = -velY * damping;
+      velX *= 0.55;
+      bounceCount++;
+      bounced = true;
+    }
+
+    float energy = (fabs(velY) + fabs(velX)) * 0.08 + 0.05;
+    ax += spinX * energy;
+    ay += spinY * energy;
+    az += spinZ * energy;
+
+    rotateOnly(ax, ay, az, rotV);
+
+    if (bounced) tft.drawRect(0, 0, tft.width(), tft.height(), ILI9341_WHITE);
+    drawSolidDice(rotV, (int)posX, (int)posY);
+    if (bounced) tft.drawRect(0, 0, tft.width(), tft.height(), ILI9341_BLACK);
+
+    delay(5);
+    frame++;
+  }
+
+  // ---- SETTLE: smoothly rotate to the chosen face ----
+  diceValue = random(1, 7);
+  float tAx = targetAngles[diceValue-1][0];
+  float tAy = targetAngles[diceValue-1][1];
+  float tAz = targetAngles[diceValue-1][2];
+
+  // normalize current angles to reduce big jumps
+  ax = fmod(ax, 2*PI);
+  ay = fmod(ay, 2*PI);
+  az = fmod(az, 2*PI);
+
+  int settleFrames = 10;
+  float startPosX = posX;
+
+  for (int s = 0; s < settleFrames; s++) {
+    float t = (float)s / (settleFrames - 1);
+    float curAx = ax + (tAx - ax) * t;
+    float curAy = ay + (tAy - ay) * t;
+    float curAz = az + (tAz - az) * t;
+    float curPosX = startPosX + (screenCenterX - startPosX) * t;
+
+    rotateOnly(curAx, curAy, curAz, rotV);
+    drawSolidDice(rotV, (int)curPosX, restY);
+    delay(50);
+  }
+
+  showResultText(diceValue);
+  delay(100);
+
+  tft.fillScreen(ILI9341_BLACK);
+  rotateOnly(0, 0, 0, rotV); // not actually neutral for this value, just resets view
+  rotateOnly(tAx, tAy, tAz, rotV);
+  drawSolidDice(rotV, screenCenterX, restY);
+  showPrompt();
+}
+
+// ---------- 3D ROTATION (no projection) ----------
+void rotateOnly(float ax, float ay, float az, float outV[8][3]) {
+  float sx = sin(ax), cx = cos(ax);
+  float sy = sin(ay), cy = cos(ay);
+  float sz = sin(az), cz = cos(az);
+
+  for (int i = 0; i < 8; i++) {
+    float x = vertices[i][0], y = vertices[i][1], z = vertices[i][2];
+
+    float y1 = y*cx - z*sx;
+    float z1 = y*sx + z*cx;
+    float x1 = x;
+
+    float x2 = x1*cy + z1*sy;
+    float z2 = -x1*sy + z1*cy;
+    float y2 = y1;
+
+    float x3 = x2*cz - y2*sz;
+    float y3 = x2*sz + y2*cz;
+    float z3 = z2;
+
+    outV[i][0] = x3; outV[i][1] = y3; outV[i][2] = z3;
+  }
+}
+
+void project(float x, float y, float z, int posX, int posY, int &outX, int &outY) {
+  float factor = fov / (distance + z);
+  outX = posX + (int)(x * factor * scaleSize);
+  outY = posY + (int)(y * factor * scaleSize);
+}
+
+// ---------- SOLID SHADED DICE RENDERER ----------
+void drawSolidDice(float rotV[8][3], int posX, int posY) {
+  int projX[8], projY[8];
+  int minX = 9999, minY = 9999, maxX = -9999, maxY = -9999;
+
+  for (int i = 0; i < 8; i++) {
+    project(rotV[i][0], rotV[i][1], rotV[i][2], posX, posY, projX[i], projY[i]);
+    if (projX[i] < minX) minX = projX[i];
+    if (projX[i] > maxX) maxX = projX[i];
+    if (projY[i] < minY) minY = projY[i];
+    if (projY[i] > maxY) maxY = projY[i];
+  }
+
+  // erase previous frame's bounding box
+  if (prevBoxW > 0) {
+    tft.fillRect(prevBoxX, prevBoxY, prevBoxW, prevBoxH, ILI9341_BLACK);
+  }
+
+  int pad = 6;
+  prevBoxX = minX - pad; prevBoxY = minY - pad;
+  prevBoxW = (maxX - minX) + pad*2; prevBoxH = (maxY - minY) + pad*2;
+
+  // determine visible faces + depth + shading
+  int visIdx[6], visCount = 0;
+  float visZ[6], visShade[6];
+
+  for (int f = 0; f < 6; f++) {
+    int v0 = faces[f].v[0], v1 = faces[f].v[1], v3 = faces[f].v[3];
+    float ux = rotV[v1][0]-rotV[v0][0], uy = rotV[v1][1]-rotV[v0][1];
+    float vx = rotV[v3][0]-rotV[v0][0], vy = rotV[v3][1]-rotV[v0][1];
+    float nz = ux*vy - uy*vx;
+
+    if (nz < 0) { // facing camera
+      float avgZ = (rotV[v0][2]+rotV[v1][2]+rotV[faces[f].v[2]][2]+rotV[v3][2]) / 4.0;
+      visIdx[visCount] = f;
+      visZ[visCount] = avgZ;
+      float bright = constrain(-nz * 60.0 + 150.0, 110, 255);
+      visShade[visCount] = bright;
+      visCount++;
+    }
+  }
+
+  // simple insertion sort: farthest (largest Z) drawn first
+  for (int i = 1; i < visCount; i++) {
+    int idx = visIdx[i]; float z = visZ[i]; float sh = visShade[i];
+    int j = i - 1;
+    while (j >= 0 && visZ[j] < z) {
+      visIdx[j+1]=visIdx[j]; visZ[j+1]=visZ[j]; visShade[j+1]=visShade[j];
+      j--;
+    }
+    visIdx[j+1]=idx; visZ[j+1]=z; visShade[j+1]=sh;
+  }
+
+  for (int k = 0; k < visCount; k++) {
+    int f = visIdx[k];
+    int v0=faces[f].v[0], v1=faces[f].v[1], v2=faces[f].v[2], v3=faces[f].v[3];
+    int x0=projX[v0], y0=projY[v0], x1=projX[v1], y1=projY[v1];
+    int x2=projX[v2], y2=projY[v2], x3=projX[v3], y3=projY[v3];
+
+    uint8_t b = (uint8_t)visShade[k];
+    uint16_t fillColor = tft.color565(b, b, b);
+
+    tft.fillTriangle(x0,y0, x1,y1, x2,y2, fillColor);
+    tft.fillTriangle(x0,y0, x2,y2, x3,y3, fillColor);
+
+    uint16_t borderColor = tft.color565(60,60,60);
+    tft.drawLine(x0,y0,x1,y1, borderColor);
+    tft.drawLine(x1,y1,x2,y2, borderColor);
+    tft.drawLine(x2,y2,x3,y3, borderColor);
+    tft.drawLine(x3,y3,x0,y0, borderColor);
+
+    // draw pips
+    int val = faces[f].value;
+    int n = pipCount[val-1];
+    for (int p = 0; p < n; p++) {
+      float pu = pipPos[val-1][p][0];
+      float pv = pipPos[val-1][p][1];
+      float tu = 0.5 + pu * 0.65;
+      float tv = 0.5 + pv * 0.65;
+
+      float px = rotV[v0][0] + tu*(rotV[v1][0]-rotV[v0][0]) + tv*(rotV[v3][0]-rotV[v0][0]);
+      float py = rotV[v0][1] + tu*(rotV[v1][1]-rotV[v0][1]) + tv*(rotV[v3][1]-rotV[v0][1]);
+      float pz = rotV[v0][2] + tu*(rotV[v1][2]-rotV[v0][2]) + tv*(rotV[v3][2]-rotV[v0][2]);
+
+      int sx, sy;
+      project(px, py, pz, posX, posY, sx, sy);
+      tft.fillCircle(sx, sy, 6, ILI9341_BLACK);
+    }
+  }
+}
+
+void showResultText(int value) {
+  tft.fillRect(0, 250, tft.width(), 40, ILI9341_BLACK);
+  tft.setTextSize(2);
+  tft.setTextColor(ILI9341_GREEN);
+  tft.setCursor(50, 260);
+  tft.print("Result: ");
+  tft.print(value);
+}
+
+void showPrompt() {
+  tft.setTextSize(2);
+  tft.setTextColor(ILI9341_YELLOW);
+  tft.setCursor(20, 260);
+  tft.print("Press button to roll");
+}
